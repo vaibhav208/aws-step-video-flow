@@ -1,0 +1,14 @@
+*.tfstate
+*.tfstate.*
+*.tfvars
+!terraform.tfvars.example
+.terraform/
+.terraform.lock.hcl
+crash.log
+crash.*.log
+modules/lambda/build/
+modules/eventbridge/build/
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json

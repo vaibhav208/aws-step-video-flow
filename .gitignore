@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Terraform (terraform/.gitignore also covers this scoped to that
+# directory specifically -- these are a defensive root-level backstop in
+# case terraform is ever run from a different working directory)
+**/.terraform/
+**/.terraform.lock.hcl
+**/*.tfstate
+**/*.tfstate.*
+**/crash.log
+**/crash.*.log
+
+# Scratch output from the manual `aws lambda invoke ... out.json` examples
+# throughout the README -- never meant to be committed, just a local
+# response dump you overwrite on every test invocation.
+out.json
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

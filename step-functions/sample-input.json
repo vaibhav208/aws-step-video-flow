@@ -1,0 +1,6 @@
+{
+  "job_id": "job-demo-0001",
+  "bucket": "REPLACE_WITH_YOUR_MEDIA_BUCKET_NAME",
+  "key": "uploads/job-demo-0001/source.mp4",
+  "resolutions": ["1080p", "720p", "480p"]
+}

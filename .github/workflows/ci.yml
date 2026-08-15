@@ -1,0 +1,81 @@
+name: CI
+
+# Runs on every push/PR to main. Deliberately narrow: mocked unit tests
+# (moto, no AWS account needed) plus static Terraform checks (fmt/validate,
+# no AWS account needed either -- validate only needs provider *schemas*,
+# which `terraform init` downloads over the network, not real credentials).
+#
+# What this workflow does NOT do: run tests/step-functions/ (the real,
+# unmocked, money-and-minutes-costing integration tests), or `terraform
+# plan`/`apply` against real infrastructure. Both require a real AWS
+# account and shouldn't fire on every push to a learning-project repo --
+# see .github/workflows/integration.yml (manually triggered) instead.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lambda-tests:
+    name: Lambda unit tests (moto)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        run: pip install -r tests/lambda/requirements-test.txt
+
+      - name: Run pytest
+        run: python -m pytest tests/lambda/ -v
+
+  video-processor-tests:
+    name: video-processor unit tests (moto + mocked ffmpeg)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        run: pip install -r tests/video-processor/requirements-test.txt
+
+      - name: Run pytest
+        run: python -m pytest tests/video-processor/ -v
+
+  terraform-check:
+    name: terraform fmt + validate
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~> 1.5"
+
+      - name: terraform fmt (check only, no changes made)
+        run: terraform fmt -check -recursive -diff
+
+      # -backend=false: this job never touches real state (local or remote)
+      # -- it only needs the provider *schema* (downloaded from the
+      # registry, which is why this job needs network access but not AWS
+      # credentials) to confirm every resource block is internally
+      # consistent. Contrast with the sandbox this project was originally
+      # developed in, where registry access was blocked and `tofu init`
+      # could only get as far as module resolution -- see
+      # docs/troubleshooting.md for that distinction.
+      - name: terraform init (no backend)
+        run: terraform init -backend=false
+
+      - name: terraform validate
+        run: terraform validate

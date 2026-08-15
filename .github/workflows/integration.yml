@@ -1,0 +1,70 @@
+name: Integration tests (real AWS)
+
+# Manually triggered ONLY (workflow_dispatch) -- deliberately not on every
+# push/PR. These tests in tests/step-functions/ drive real Step Functions
+# executions against a real deployed stack: real S3 uploads, real ECS
+# Fargate tasks, real DynamoDB writes. That means real (small, but
+# nonzero) cost and multi-minute runtime per run -- appropriate to run
+# on demand before a release or after infra changes, not on every commit
+# to a learning-project repo. See tests/step-functions/conftest.py's
+# module docstring and docs/troubleshooting.md for the full reasoning.
+#
+# Requires the target stack to already be deployed (`terraform apply` from
+# a local machine or a separate deploy workflow -- this workflow does NOT
+# provision or tear down infrastructure itself, on purpose: spinning up a
+# full VPC/ECS/Lambda/Step-Functions stack just to run three tests and
+# then destroying it again would multiply both the cost and the runtime of
+# this workflow for no real benefit over pointing it at a persistent dev
+# stack).
+#
+# Configure these before running:
+#   1. An IAM role in your AWS account trusted for GitHub's OIDC provider,
+#      scoped to (at minimum) states:StartExecution/DescribeExecution on
+#      your state machine, s3:PutObject on the media bucket's uploads/
+#      prefix, and dynamodb:GetItem on the jobs table -- deliberately
+#      narrower than the Terraform-deploying identity from the root
+#      README's "AWS setup" section, since this workflow only exercises
+#      the pipeline, it doesn't deploy it.
+#   2. Repository secrets/variables:
+#      - AWS_INTEGRATION_TEST_ROLE_ARN (secret) -- the role from step 1
+#      - AWS_REGION (variable, or hardcode below)
+#      - STATE_MACHINE_ARN, MEDIA_BUCKET_NAME, DYNAMODB_TABLE_NAME
+#        (variables, or secrets if you'd rather not expose resource names
+#        in workflow logs) -- these are also exactly what
+#        `terraform output` prints after applying terraform/, so copying
+#        them in is a one-time, one-minute setup step.
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write # required for the OIDC AssumeRoleWithWebIdentity below
+  contents: read
+
+jobs:
+  integration:
+    name: Real pipeline execution tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        run: pip install -r tests/step-functions/requirements-test.txt
+
+      - name: Configure AWS credentials (OIDC, no long-lived keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_INTEGRATION_TEST_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Run real end-to-end tests
+        env:
+          STATE_MACHINE_ARN: ${{ vars.STATE_MACHINE_ARN }}
+          MEDIA_BUCKET_NAME: ${{ vars.MEDIA_BUCKET_NAME }}
+          DYNAMODB_TABLE_NAME: ${{ vars.DYNAMODB_TABLE_NAME }}
+          AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+        run: python -m pytest tests/step-functions/ -v
