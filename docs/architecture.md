@@ -22,6 +22,7 @@ explicitly.
 | CloudWatch dashboards/alarms | ✅ Built — Phase 4 |
 | CI/CD, real execution-based tests, troubleshooting docs | ✅ Built — Phase 5 |
 | API (FastAPI) | ❌ Skipped (Phase 5, optional) — see `src/api/README.md` |
+| Web frontend + presign/status API (API Gateway + Lambda) | ✅ Built — Phase 6 |
 
 ## System overview
 
@@ -405,3 +406,62 @@ ECS/Fargate CPU/Memory dashboard widget (the video-processor task runs via
 per-run metrics require Container Insights — a real recurring per-metric
 cost this learning project doesn't take on, documented as a dashboard text
 widget rather than a silent omission).
+
+## Web frontend + presign/status API (built in Phase 6)
+
+Purely additive: a third way to trigger and observe the same pipeline
+(alongside the manual `start-execution` CLI path and the Phase 4 S3-upload
+auto-trigger), and the only one with a visual, real-time view of execution
+progress. Nothing built in Phases 1-5 depends on this module, or even knows
+it exists — it consumes `module.s3`'s bucket and `module.step_functions`'s
+state machine ARN as plain read-only inputs, the same way `module.eventbridge`
+does, and is created last in `terraform/main.tf` for the identical reason
+(it needs `state_machine_arn`, which doesn't exist until Phase 3 has run).
+
+**Why one Lambda for two routes.** Every other Lambda in this project is
+one function per concern (`validate`, `database`, `metadata`, `thumbnail`,
+`trigger`) — different timeout/memory profiles, different triggers,
+different blast radius if one misbehaves. `web_api`'s two routes
+(`POST /presign`, `GET /status/{job_id}`) don't have any of those reasons to
+split: both are small, read-mostly, share one IAM role's worth of
+permissions, and exist purely to serve one frontend. A single Lambda with an
+internal router (`src/lambda/web_api/handler.py`'s `lambda_handler`)
+dispatching on `event["requestContext"]["http"]["method"]` +
+`event["rawPath"]` keeps the infrastructure footprint down without actually
+losing any of the separation that matters (the two routes still have
+separately-scoped IAM statements within that one role — presign can only
+`s3:PutObject` under `uploads/*`; status can only `states:DescribeExecution`
+/ `states:GetExecutionHistory` on this state machine's executions, never
+`StartExecution`).
+
+**Collapsing ~20 ASL states onto 9 frontend nodes.** The state machine
+(`step-functions/state-machine.asl.json.tpl`) has states for plumbing —
+`IsVideoValid` (Choice), `BuildExecutionSummary` (Pass), `StaggerLaunch`
+(Wait), the three `Handle*Failure` Tasks — that a human watching a progress
+bar doesn't need surfaced individually. `web_api`'s `_STATE_TO_NODE` mapping
+picks the 9 states a viewer actually cares about (Initialize Job → Validate
+→ [Generate Thumbnail | Extract Metadata] in parallel → Record Media Details
+→ Transcode → Record Job Complete → Notify → Done) and derives each one's
+`pending`/`running`/`succeeded`/`failed` status by walking
+`GetExecutionHistory`'s `stateEnteredEventDetails`/`stateExitedEventDetails`
+events for just those names. `TranscodeAllResolutions` is a Map state, so
+its inner `RunTranscodeTask` state enters/exits once per resolution (default
+3) rather than once overall — tracked as a running count
+(`transcode_entered`/`transcode_exited`) so the frontend can show
+"2/3 resolutions complete" instead of a single opaque spinner. `Fail` and
+`Succeed` states get special-cased too: *entering* one is itself terminal
+(neither type ever "exits" the way a `Task` does), so `ValidationFailedState`
+/ `ResolutionFailed`/`ProcessingFailedState` immediately mark the `done` node
+failed, and `JobSucceeded` immediately marks it succeeded, on entry rather
+than waiting for an exit event that will never come.
+
+**Deliberately open CORS / public S3 read.** The API Gateway HTTP API's
+`cors_configuration` allows any origin, and the frontend S3 bucket's policy
+grants anonymous `s3:GetObject` — appropriate for a public demo page with no
+secrets in it (the only privileged operations, presigning uploads and
+reading execution state, happen through `web_api`'s own scoped IAM role, not
+through anything public), but a deliberate simplification worth tightening
+(`allow_origins`, real auth in front of `/presign`) before this pattern is
+reused for anything handling real user data. No CloudFront/ACM/HTTPS either
+— the frontend bucket serves plain HTTP via S3 website hosting, the simplest
+option for a learning project's demo page.

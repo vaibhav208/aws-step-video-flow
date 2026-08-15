@@ -173,3 +173,19 @@ output "cloudwatch_dashboard_url" {
   description = "Direct link to the dashboard in the AWS console."
   value       = "https://${var.aws_region}.console.aws.amazon.com/cloudwatch/home?region=${var.aws_region}#dashboards:name=${module.cloudwatch.dashboard_name}"
 }
+
+# --- Web (Phase 6) -----------------------------------------------------------
+
+output "web_frontend_url" {
+  description = "Open this in a browser: upload a video and watch the pipeline's state transitions live."
+  value       = module.web.frontend_url
+}
+
+output "web_api_invoke_url" {
+  description = "Base URL for the frontend's own API (POST /presign, GET /status/{job_id})."
+  value       = module.web.api_invoke_url
+}
+
+output "web_api_function_name" {
+  value = module.web.web_api_function_name
+}

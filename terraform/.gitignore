@@ -8,6 +8,7 @@ crash.log
 crash.*.log
 modules/lambda/build/
 modules/eventbridge/build/
+modules/web/build/
 override.tf
 override.tf.json
 *_override.tf

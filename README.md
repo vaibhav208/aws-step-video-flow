@@ -55,22 +55,25 @@ EventBridge · CloudWatch · IAM · (optionally) API Gateway
 │       ├── step-functions/       # ✅ Phase 3 — state machine + execution IAM role
 │       ├── sns/                  # ✅ Phase 4 — notifications topic
 │       ├── eventbridge/          # ✅ Phase 4 — S3 upload trigger Lambda + rule
-│       └── cloudwatch/           # ✅ Phase 4 — alarms + dashboard
+│       ├── cloudwatch/           # ✅ Phase 4 — alarms + dashboard
+│       └── web/                  # ✅ Phase 6 — presign/status API Gateway + Lambda + frontend hosting
 ├── src/
 │   ├── lambda/
 │   │   ├── validate/             # ✅ Phase 2 — zip-packaged
 │   │   ├── database/             # ✅ Phase 2 — zip-packaged
 │   │   ├── ffmpeg/                # ✅ Phase 2 — container image (metadata + thumbnail)
-│   │   └── trigger/               # ✅ Phase 4 — zip-packaged, S3 upload → StartExecution
+│   │   ├── trigger/               # ✅ Phase 4 — zip-packaged, S3 upload → StartExecution
+│   │   └── web_api/               # ✅ Phase 6 — zip-packaged, /presign + /status/{job_id}
 │   ├── video-processor/          # ✅ Phase 2 — Dockerized FFmpeg transcoder (ECS)
 │   └── api/                      # ❌ Skipped (Phase 5, optional) — see src/api/README.md
 ├── step-functions/               # ✅ Phase 3 — ASL state machine definition + docs
+├── frontend/                     # ✅ Phase 6 — index.html.tpl, live state-transition viewer
 ├── scripts/
 │   ├── deploy.sh                 # ✅ Phase 1 — terraform init/plan/apply wrapper
 │   ├── build.sh                  # ✅ Phase 2 — Docker build/push (2 images)
 │   └── upload-test-video.sh      # ✅ Phase 4 — trigger a real execution
 ├── tests/
-│   ├── lambda/                   # ✅ Phase 2/4 — pytest + moto, validate/database/trigger
+│   ├── lambda/                   # ✅ Phase 2/4/6 — pytest + moto, validate/database/trigger/web_api
 │   ├── video-processor/          # ✅ Phase 2 — pytest + moto, ffmpeg mocked
 │   └── step-functions/           # ✅ Phase 5 — real, execution-based, deployed-stack tests
 ├── .github/workflows/            # ✅ Phase 5 — ci.yml (every push) + integration.yml (manual)
@@ -93,7 +96,8 @@ is the one exception that stays permanently unbuilt by choice — its
 | 2 | Lambda functions, Dockerized FFmpeg processor, ECR, ECS/Fargate, networking | ✅ Done |
 | 3 | Step Functions state machine: Task/Choice/Parallel/Map/Wait/Retry/Catch/InputPath/ResultPath/OutputPath | ✅ Done |
 | 4 | EventBridge auto-trigger, SNS notifications, CloudWatch alarms/dashboard | ✅ Done |
-| **5** | GitHub Actions CI/CD, real execution-based tests, troubleshooting guide, interview questions (API skipped — see `src/api/README.md`) | ✅ **Done — this README covers it** |
+| 5 | GitHub Actions CI/CD, real execution-based tests, troubleshooting guide, interview questions (API skipped — see `src/api/README.md`) | ✅ Done |
+| **6** | Optional web frontend + presign/status API Gateway+Lambda backend | ✅ **Done — this README covers it** |
 
 ## 6. Prerequisites
 
@@ -672,26 +676,137 @@ only — it will not fire on its own).
   is either free (static checks) or billed only for the seconds an
   on-demand workflow run actually executes.
 
-## 28. Project status: all five phases complete
+## 28. Terraform deployment — Phase 6 (web frontend, optional)
+
+Phase 6 is entirely additive on top of everything Phases 1-5 built: a
+small browser frontend (`frontend/index.html.tpl`) that uploads a video and
+animates the resulting Step Functions execution's state transitions live,
+plus its own tiny backend — one Lambda (`web_api`) behind an API Gateway
+HTTP API — that serves it. Nothing else in the project depends on this
+module; skip it entirely if you only want the CLI/console-driven workflow
+from the earlier sections.
+
+```bash
+cd terraform
+terraform apply
+```
+
+No bootstrap dance here either — like Phase 4, this only references
+resources (the media bucket, the state machine) that already exist by the
+time you get here. This creates:
+
+- The **`web_api` Lambda** (zip-packaged, same mechanism as `validate`/
+  `database`) and its own dedicated IAM role, split into two narrowly-scoped
+  policies: `s3:PutObject` on `uploads/*` only (for presigning new-job
+  upload URLs — never a read, list, or write anywhere else in the bucket),
+  and `states:DescribeExecution` + `states:GetExecutionHistory` scoped to
+  executions of this one state machine only (never `StartExecution` — that
+  stays the trigger Lambda's job from Phase 4).
+- An **API Gateway HTTP API** with two routes (`POST /presign`,
+  `GET /status/{job_id}`) and CORS wide open (`allow_origins = ["*"]`),
+  matching the media bucket's own CORS default — see the cost/security note
+  below before using this pattern beyond a demo.
+- An **S3 bucket configured for static website hosting**, serving the
+  single rendered `index.html` with the real, deployed API Gateway invoke
+  URL baked in at apply time (`terraform/modules/web/main.tf`'s
+  `aws_s3_object.index`).
+
+Full design rationale — why one Lambda for two routes instead of this
+project's usual one-Lambda-per-concern pattern, why the frontend collapses
+the ASL's ~20 states onto 9 simplified visual nodes, and the plain-HTTP/
+open-CORS tradeoffs — is documented directly in
+[`src/lambda/web_api/handler.py`](src/lambda/web_api/handler.py)'s and
+[`terraform/modules/web/main.tf`](terraform/modules/web/main.tf)'s header
+comments.
+
+## 29. Using the web frontend
+
+```bash
+terraform output web_frontend_url
+```
+
+Open that URL in a browser, choose a video file, and click **Start
+Processing**. The page requests a pre-signed upload URL, PUTs the file
+straight to S3 (browser → S3 directly, not proxied through the Lambda),
+then polls `GET /status/{job_id}` every 2 seconds and lights up each stage
+— Initialize Job, Validate, the parallel Thumbnail/Metadata branch,
+Transcode (with a live `x/N resolutions` counter), Record Complete, Notify,
+and the final result — as the real execution progresses. This is a second,
+independent way to trigger and watch the exact same pipeline the CLI paths
+in sections 17 and 21 use; all three (manual `start-execution`, S3 CLI
+upload, and this frontend) start the identical state machine.
+
+## 30. Verifying Phase 6
+
+```bash
+# web_api Lambda exists and is Active
+aws lambda get-function --function-name "$(cd terraform && terraform output -raw web_api_function_name)" \
+  --query 'Configuration.{Name:FunctionName,State:State,Timeout:Timeout,Memory:MemorySize}'
+
+# API Gateway responds (expect a 404 JSON body for a route that doesn't
+# exist -- that's the Lambda's own router replying, which confirms the
+# whole chain -- API Gateway -> Lambda permission -> Lambda -- is wired up)
+curl -s "$(cd terraform && terraform output -raw web_api_invoke_url)/nope"
+
+# Frontend bucket serves the page
+curl -s -o /dev/null -w '%{http_code}\n' "$(cd terraform && terraform output -raw web_frontend_url)"
+```
+
+Or just open `terraform output web_frontend_url` in a browser and run
+section 29's upload flow end to end — the state diagram lighting up green
+in real time is the real verification.
+
+## 31. Cost notes (Phase 6 additions)
+
+- **API Gateway HTTP API**: $1.00 per million requests past a 1M/month free
+  tier that never resets by account age — a learning project's manual demo
+  sessions won't come close.
+- **Extra Lambda invocation**: `web_api` is tiny (128MB) and only runs while
+  someone is actively using the frontend — negligible at this volume, same
+  free-tier headroom discussed in section 15.
+- **S3 static website hosting**: no extra charge beyond ordinary S3
+  storage/request pricing for one small HTML file — effectively free.
+- **CloudWatch Logs** (API Gateway access logs + the Lambda's own log
+  group): both already covered by `log_retention_days`, same as every
+  other function in this project.
+
+Nothing here adds a new fixed monthly cost the way the Phase 4 dashboard
+does. The one thing worth deliberately noting, not a cost concern but a
+security tradeoff: both the API's CORS policy and the frontend bucket's
+read policy are wide open (`*`) by design, appropriate for a public demo
+of a project with no sensitive data, but not a pattern to copy into
+anything handling real user data without tightening `allow_origins` and
+adding real authentication in front of `/presign`.
+
+---
+
+## 32. Project status: all six phases complete
 
 Every phase from the original plan is now built, tested (to the extent
 testable without live infrastructure in some development environments —
 see `docs/troubleshooting.md`), documented, and verified on the actual
-target device. The one deliberate scope decision worth restating: the
-optional FastAPI layer (`src/api/`) was not built — see
-[`src/api/README.md`](src/api/README.md) for why, and what it would take
-to add if you want it later.
+target device — including Phase 6, the optional web frontend, added after
+the first real end-to-end deployment surfaced and fixed a production bug
+(see the `_to_dynamodb_safe` note in
+[`src/lambda/database/handler.py`](src/lambda/database/handler.py)). The
+one deliberate scope decision worth restating: the optional FastAPI layer
+(`src/api/`) was not built — see [`src/api/README.md`](src/api/README.md)
+for why, and what it would take to add if you want it later. Phase 6's
+`web_api` Lambda is a narrower, purpose-built alternative that covers what
+this project actually needed (presign + status) without taking on a full
+REST API's scope.
 
 From here, natural next steps if you want to keep extending this project
 are documented, not required: a remote Terraform backend (S3 + DynamoDB
 locking, sketched in `terraform/providers.tf`) for team use instead of
 local state; splitting the single SNS topic into success/failure/ops
-topics with routing rules; per-Lambda X-Ray tracing; or actually building
-`src/api/` per the notes above.
+topics with routing rules; per-Lambda X-Ray tracing; fronting the Phase 6
+bucket with CloudFront for real HTTPS; or actually building `src/api/` per
+the notes above.
 
 ---
 
-## 29. Interview questions this project is built to answer
+## 33. Interview questions this project is built to answer
 
 A learning/portfolio project is more useful if it can survive being
 questioned, not just demoed. These are the questions this specific

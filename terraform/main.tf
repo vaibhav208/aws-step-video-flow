@@ -202,7 +202,24 @@ module "cloudwatch" {
 }
 
 # ---------------------------------------------------------------------------
-# Later phases plug in here, e.g.:
-#
-# module "api"              { source = "./modules/api"              ... }  # Phase 5 (optional)
+# Phase 6 module — a small browser frontend + its API Gateway/Lambda
+# backend, entirely optional and additive on top of everything above. Same
+# "created last" reasoning as eventbridge: needs module.step_functions'
+# state_machine_arn, which doesn't exist until Phase 3 has run. See
+# terraform/modules/web/main.tf's header comment for the full picture.
 # ---------------------------------------------------------------------------
+
+module "web" {
+  source = "./modules/web"
+
+  name_prefix = local.name_prefix
+  account_id  = data.aws_caller_identity.current.account_id
+
+  media_bucket_name = module.s3.bucket_id
+  media_bucket_arn  = module.s3.bucket_arn
+  state_machine_arn = module.step_functions.state_machine_arn
+
+  log_retention_days = var.log_retention_days
+
+  tags = local.common_tags
+}

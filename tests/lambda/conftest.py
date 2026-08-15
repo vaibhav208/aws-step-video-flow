@@ -60,3 +60,10 @@ def trigger_handler(monkeypatch):
     # import time lines up with what moto actually creates.
     monkeypatch.setenv("STATE_MACHINE_ARN", TEST_STATE_MACHINE_ARN)
     return _load_handler_module("trigger_handler_module", "trigger")
+
+
+@pytest.fixture
+def web_api_handler(monkeypatch):
+    monkeypatch.setenv("MEDIA_BUCKET", "test-media-bucket")
+    monkeypatch.setenv("STATE_MACHINE_ARN", TEST_STATE_MACHINE_ARN)
+    return _load_handler_module("web_api_handler_module", "web_api")
