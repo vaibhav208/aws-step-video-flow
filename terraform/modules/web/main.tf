@@ -54,9 +54,7 @@ resource "aws_iam_role" "web_api" {
 }
 
 # Only what /presign needs: sign PUT URLs for new-job source videos.
-# Scoped to uploads/*, not the whole bucket -- this function never reads or
-# lists anything, and has no business touching processed/thumbnails/
-# metadata output prefixes.
+# Scoped to uploads/*, not the whole bucket.
 data "aws_iam_policy_document" "web_api_s3" {
   statement {
     sid       = "PresignUploadUrls"
@@ -73,6 +71,31 @@ resource "aws_iam_policy" "web_api_s3" {
 resource "aws_iam_role_policy_attachment" "web_api_s3" {
   role       = aws_iam_role.web_api.name
   policy_arn = aws_iam_policy.web_api_s3.arn
+}
+
+# Only what /download/{job_id} needs: sign GET URLs for the pipeline's own
+# output (thumbnails and transcoded resolutions), never uploads/* -- a
+# separate, narrower policy from web_api_s3 above rather than widening that
+# one, so each policy's name still says exactly what it grants.
+data "aws_iam_policy_document" "web_api_s3_downloads" {
+  statement {
+    sid     = "PresignDownloadUrls"
+    actions = ["s3:GetObject"]
+    resources = [
+      "${var.media_bucket_arn}/thumbnails/*",
+      "${var.media_bucket_arn}/processed/*",
+    ]
+  }
+}
+
+resource "aws_iam_policy" "web_api_s3_downloads" {
+  name   = "${var.name_prefix}-web-api-s3-downloads"
+  policy = data.aws_iam_policy_document.web_api_s3_downloads.json
+}
+
+resource "aws_iam_role_policy_attachment" "web_api_s3_downloads" {
+  role       = aws_iam_role.web_api.name
+  policy_arn = aws_iam_policy.web_api_s3_downloads.arn
 }
 
 # Only what /status/{job_id} needs: read-only visibility into executions of
@@ -148,12 +171,14 @@ resource "aws_lambda_function" "web_api" {
       MEDIA_BUCKET                 = var.media_bucket_name
       STATE_MACHINE_ARN            = var.state_machine_arn
       PRESIGNED_URL_EXPIRY_SECONDS = tostring(var.presigned_url_expiry_seconds)
+      DOWNLOAD_URL_EXPIRY_SECONDS  = tostring(var.download_url_expiry_seconds)
     }
   }
 
   depends_on = [
     aws_cloudwatch_log_group.web_api,
     aws_iam_role_policy_attachment.web_api_s3,
+    aws_iam_role_policy_attachment.web_api_s3_downloads,
     aws_iam_role_policy_attachment.web_api_sfn,
     aws_iam_role_policy_attachment.web_api_logs,
   ]
@@ -193,6 +218,12 @@ resource "aws_apigatewayv2_route" "presign" {
 resource "aws_apigatewayv2_route" "status" {
   api_id    = aws_apigatewayv2_api.web.id
   route_key = "GET /status/{job_id}"
+  target    = "integrations/${aws_apigatewayv2_integration.web_api.id}"
+}
+
+resource "aws_apigatewayv2_route" "download" {
+  api_id    = aws_apigatewayv2_api.web.id
+  route_key = "GET /download/{job_id}"
   target    = "integrations/${aws_apigatewayv2_integration.web_api.id}"
 }
 

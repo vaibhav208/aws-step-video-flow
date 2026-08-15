@@ -736,6 +736,26 @@ independent way to trigger and watch the exact same pipeline the CLI paths
 in sections 17 and 21 use; all three (manual `start-execution`, S3 CLI
 upload, and this frontend) start the identical state machine.
 
+**Choosing resolutions from the browser.** Before clicking Start
+Processing, check/uncheck any of the six resolutions (1440p/1080p/720p/
+480p/360p/240p — default: 1080p/720p/480p). The choice is baked into the
+presigned upload as `x-amz-meta-resolutions` object metadata; the
+`trigger` Lambda reads it back via its own `HeadObject` call once the
+upload fires the pipeline (EventBridge's S3 event itself carries no object
+metadata, so it can't be threaded straight through that path — see
+`src/lambda/trigger/handler.py`'s docstring). Anything uploaded outside the
+web frontend (S3 console, CLI, `scripts/upload-test-video.sh`) has no such
+metadata and still gets the `TARGET_RESOLUTIONS` Terraform default,
+unchanged.
+
+**Downloading the thumbnail and transcoded videos.** Once a job finishes
+successfully, the page calls `GET /download/{job_id}` and shows a
+thumbnail preview plus one download button per resolution that actually
+finished. These are short-lived pre-signed S3 GET URLs (`web_api`'s IAM
+role has narrow `s3:GetObject` on `thumbnails/*` and `processed/*` only) —
+the media bucket itself has no public read access, so this route is the
+only way a browser can fetch pipeline output at all.
+
 ## 30. Verifying Phase 6
 
 ```bash

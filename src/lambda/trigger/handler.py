@@ -43,6 +43,20 @@ execution. That's judged the right default for this project (one S3 upload
 would need a caller-supplied distinct job_id, which is how the manual
 `aws stepfunctions start-execution` path (step-functions/README.md) already
 works.
+
+Per-upload resolution choice (added alongside the web frontend, Phase 6)
+--------------------------------------------------------------------------
+EventBridge's S3 "Object Created" notification does NOT include the
+object's user-defined metadata — only bucket/key/size/etag/etc — so this
+function can't read a caller's resolution choice straight off the event
+that woke it up. Instead, `web_api`'s `/presign` route (see
+src/lambda/web_api/handler.py) signs the upload with an
+`x-amz-meta-resolutions` header baked into the presigned URL, and this
+function makes its own HeadObject call to read that metadata back once the
+event fires. Any upload that doesn't go through the web frontend (the S3
+console, the CLI, `scripts/upload-test-video.sh`, a direct `aws s3 cp`) has
+no such metadata, so it falls through to the same TARGET_RESOLUTIONS
+default this function has always used — this is purely additive.
 """
 
 from __future__ import annotations
@@ -58,9 +72,15 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 sfn = boto3.client("stepfunctions")
+s3 = boto3.client("s3")
 
 STATE_MACHINE_ARN = os.environ["STATE_MACHINE_ARN"]
 DEFAULT_TARGET_RESOLUTIONS = "1080p,720p,480p"
+
+# Mirrors src/video-processor/app/main.py's RESOLUTION_PRESETS keys — kept
+# as a separate literal here (rather than imported) because this function
+# and the ECS app are packaged and deployed completely independently.
+ALLOWED_RESOLUTIONS = {"1440p", "1080p", "720p", "480p", "360p", "240p"}
 
 
 class UnrecognizedKeyShapeError(Exception):
@@ -70,6 +90,45 @@ class UnrecognizedKeyShapeError(Exception):
 def _target_resolutions() -> list[str]:
     raw = os.environ.get("TARGET_RESOLUTIONS", DEFAULT_TARGET_RESOLUTIONS)
     return [r.strip() for r in raw.split(",") if r.strip()]
+
+
+def _dedupe_preserve_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for v in values:
+        if v not in seen:
+            seen.add(v)
+            result.append(v)
+    return result
+
+
+def _resolutions_for_upload(bucket: str, key: str) -> list[str]:
+    """Reads the uploaded object's `resolutions` metadata (set by web_api's
+    /presign) and falls back to the project-wide TARGET_RESOLUTIONS default
+    whenever that metadata is missing, unreadable, or contains nothing
+    recognized. A HeadObject failure (object not there yet, wrong bucket in
+    a test, permissions hiccup) is treated the same as "no metadata" rather
+    than as a reason to fail the whole trigger — starting the execution
+    with sane defaults is better than not starting it at all, and the
+    (separate) validate Lambda is what actually decides pass/fail once the
+    execution reaches ValidateVideo.
+    """
+    try:
+        head = s3.head_object(Bucket=bucket, Key=key)
+    except ClientError as exc:
+        logger.info(
+            "Could not read metadata for s3://%s/%s (%s) — using default resolutions",
+            bucket, key, exc,
+        )
+        return _target_resolutions()
+
+    raw = head.get("Metadata", {}).get("resolutions", "")
+    requested = [r.strip() for r in raw.split(",") if r.strip()]
+    valid = _dedupe_preserve_order([r for r in requested if r in ALLOWED_RESOLUTIONS])
+
+    if not valid:
+        return _target_resolutions()
+    return valid
 
 
 def _job_id_from_key(key: str) -> str:
@@ -105,7 +164,7 @@ def lambda_handler(event, context):  # noqa: ARG001 - context required by Lambda
         "job_id": job_id,
         "bucket": bucket,
         "key": key,
-        "resolutions": _target_resolutions(),
+        "resolutions": _resolutions_for_upload(bucket, key),
     }
 
     logger.info(

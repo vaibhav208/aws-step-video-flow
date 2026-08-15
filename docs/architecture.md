@@ -465,3 +465,34 @@ through anything public), but a deliberate simplification worth tightening
 reused for anything handling real user data. No CloudFront/ACM/HTTPS either
 — the frontend bucket serves plain HTTP via S3 website hosting, the simplest
 option for a learning project's demo page.
+
+**Per-upload resolution choice, and download links (third route added to
+`web_api`).** The frontend originally had no way to influence which
+resolutions got transcoded (always the `trigger` Lambda's
+`TARGET_RESOLUTIONS` default) and no way to fetch the thumbnail or a
+transcoded video back out — `thumbnail_key`/`resolutions_processed` came
+back from `/status` as plain strings in the execution output, not usable
+URLs, and the media bucket has no public read access. Both gaps are closed
+the same way the rest of this module works: additively, with narrowly
+scoped IAM.
+
+- `/presign` now accepts an optional `{"resolutions": [...]}` body,
+  validated against the same six-value set `RunTranscodeTask`'s ECS
+  container understands, and bakes the (possibly-defaulted) choice into the
+  presigned PUT as `x-amz-meta-resolutions` object metadata — the one
+  mechanism available, since EventBridge's S3 "Object Created" event
+  carries no object metadata itself. `trigger`'s `_resolutions_for_upload()`
+  reads it back via its own `HeadObject` call, which is why the
+  `trigger_execution` IAM role picked up one new narrowly-scoped permission
+  (`s3:GetObject` on `uploads/*`) alongside its existing `StartExecution`.
+  Any upload that doesn't carry that metadata (S3 console, CLI, this
+  project's own `scripts/upload-test-video.sh`) is unaffected — same
+  `TARGET_RESOLUTIONS` default as before this change.
+- A new `GET /download/{job_id}` route re-checks the execution is
+  `SUCCEEDED` (never trusts the caller), then turns
+  `BuildExecutionSummary`'s `thumbnail_key` and `resolutions_processed`
+  into short-lived pre-signed GET URLs. This is `web_api`'s only read
+  access to actual pipeline output — a second, separate IAM statement
+  (`s3:GetObject` on `thumbnails/*` and `processed/*`) rather than widening
+  the existing presign-only policy, so each policy in the role still
+  documents exactly what it grants at a glance.

@@ -64,6 +64,12 @@ variable "presigned_url_expiry_seconds" {
   default     = 300
 }
 
+variable "download_url_expiry_seconds" {
+  description = "How long a presigned GET URL for a thumbnail or transcoded resolution (from GET /download/{job_id}) stays valid."
+  type        = number
+  default     = 3600
+}
+
 variable "log_retention_days" {
   type    = number
   default = 14

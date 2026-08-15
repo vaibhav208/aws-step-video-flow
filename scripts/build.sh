@@ -41,7 +41,42 @@ tf_output() {
 }
 
 aws_region() {
-  tf_output aws_region
+  # Prefer an explicit env var if the caller set one.
+  if [[ -n "${AWS_REGION:-}" ]]; then
+    echo "$AWS_REGION"
+    return
+  fi
+  if [[ -n "${AWS_DEFAULT_REGION:-}" ]]; then
+    echo "$AWS_DEFAULT_REGION"
+    return
+  fi
+
+  local region
+  region="$(tf_output aws_region 2>/dev/null || true)"
+  if [[ -n "$region" ]]; then
+    echo "$region"
+    return
+  fi
+
+  # Fallback for the very first bootstrap apply
+  # (`terraform apply -target=module.ecs.aws_ecr_repository.video_processor
+  # -target=module.lambda.aws_ecr_repository.lambda_ffmpeg`, see the header
+  # comment above): Terraform's -target only writes outputs that are
+  # actually reachable from the targeted resources. `aws_region` has no
+  # resource dependency at all (it's plain `value = var.aws_region`), so a
+  # targeted apply leaves it out of state entirely even though the two ECR
+  # repos it WAS targeting were created successfully -- read it straight
+  # out of terraform.tfvars instead of failing here.
+  region="$(grep -E '^[[:space:]]*aws_region[[:space:]]*=' "$TF_DIR/terraform.tfvars" 2>/dev/null \
+    | tail -1 | sed -E 's/^[^=]*=[[:space:]]*"?([^"[:space:]]*)"?.*/\1/')"
+  if [[ -n "$region" ]]; then
+    echo "$region"
+    return
+  fi
+
+  echo "Could not determine the AWS region (checked \$AWS_REGION, \$AWS_DEFAULT_REGION," \
+       "'terraform output aws_region', and $TF_DIR/terraform.tfvars). Set AWS_REGION explicitly." >&2
+  exit 1
 }
 
 ecr_login() {

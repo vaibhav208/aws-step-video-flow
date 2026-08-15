@@ -1,0 +1,43 @@
+# Copy this file to terraform.tfvars and adjust as needed.
+# terraform.tfvars is gitignored — never commit real account-specific values if
+# they differ from these safe defaults.
+
+project_name = "aws-step-video-flow"
+environment  = "dev"
+aws_region   = "us-east-1"
+owner        = "your-name"
+
+# S3
+s3_force_destroy                      = true
+s3_enable_versioning                  = true
+s3_noncurrent_version_expiration_days = 30
+s3_abort_incomplete_multipart_days    = 7
+s3_enable_cors                        = true
+s3_cors_allowed_origins               = ["*"]
+
+# DynamoDB
+dynamodb_enable_point_in_time_recovery = false
+
+# Networking
+vpc_cidr = "10.0.0.0/16"
+az_count = 2
+
+# ECS / Fargate
+ecs_task_cpu    = "1024"
+ecs_task_memory = "3072"
+
+# Lambda
+allowed_video_formats = "mp4,mov,mkv,avi"
+max_file_size_bytes   = 5368709120
+
+# Observability
+log_retention_days = 14
+
+# Step Functions
+ecs_runtask_stagger_seconds = 3
+
+# SNS / EventBridge / CloudWatch
+# notification_email          = "you@example.com"  # uncomment to subscribe; AWS emails a confirmation link
+trigger_target_resolutions        = "1080p,720p,480p"
+sfn_alarm_evaluation_period_seconds = 300
+sfn_alarm_threshold                 = 1

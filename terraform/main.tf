@@ -169,6 +169,7 @@ module "eventbridge" {
   name_prefix = local.name_prefix
 
   media_bucket_name  = module.s3.bucket_id
+  media_bucket_arn   = module.s3.bucket_arn
   state_machine_arn  = module.step_functions.state_machine_arn
   target_resolutions = var.trigger_target_resolutions
   log_retention_days = var.log_retention_days

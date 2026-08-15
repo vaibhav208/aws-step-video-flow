@@ -39,10 +39,12 @@ resource "aws_iam_role" "trigger" {
   tags               = var.tags
 }
 
-# The ONLY AWS API this function calls is StartExecution, scoped to exactly
-# this one state machine -- it never touches S3 or DynamoDB directly (it
-# only reads bucket/key out of the EventBridge event payload it's already
-# been given), so no other policy is attached to this role.
+# The two AWS APIs this function calls: StartExecution, scoped to exactly
+# this one state machine, and (added alongside the web frontend, Phase 6)
+# a read-only HeadObject so it can pick up a per-upload resolution choice
+# from the object's metadata -- see _resolutions_for_upload() in
+# src/lambda/trigger/handler.py. It never writes to S3 and never touches
+# DynamoDB directly.
 data "aws_iam_policy_document" "trigger_start_execution" {
   statement {
     sid       = "StartVideoPipelineExecution"
@@ -59,6 +61,24 @@ resource "aws_iam_policy" "trigger_start_execution" {
 resource "aws_iam_role_policy_attachment" "trigger_start_execution" {
   role       = aws_iam_role.trigger.name
   policy_arn = aws_iam_policy.trigger_start_execution.arn
+}
+
+data "aws_iam_policy_document" "trigger_s3_read" {
+  statement {
+    sid       = "ReadUploadedObjectMetadata"
+    actions   = ["s3:GetObject"]
+    resources = ["${var.media_bucket_arn}/uploads/*"]
+  }
+}
+
+resource "aws_iam_policy" "trigger_s3_read" {
+  name   = "${var.name_prefix}-trigger-s3-read"
+  policy = data.aws_iam_policy_document.trigger_s3_read.json
+}
+
+resource "aws_iam_role_policy_attachment" "trigger_s3_read" {
+  role       = aws_iam_role.trigger.name
+  policy_arn = aws_iam_policy.trigger_s3_read.arn
 }
 
 data "aws_iam_policy_document" "trigger_logs" {
@@ -114,6 +134,7 @@ resource "aws_lambda_function" "trigger" {
   depends_on = [
     aws_cloudwatch_log_group.trigger,
     aws_iam_role_policy_attachment.trigger_start_execution,
+    aws_iam_role_policy_attachment.trigger_s3_read,
     aws_iam_role_policy_attachment.trigger_logs,
   ]
   tags = var.tags

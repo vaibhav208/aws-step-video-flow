@@ -138,7 +138,7 @@ def test_handle_presign_returns_valid_shape(web_api_handler):
         s3 = boto3.client("s3", region_name=REGION)
         s3.create_bucket(Bucket="test-media-bucket")
 
-        response = web_api_handler._handle_presign()
+        response = web_api_handler._handle_presign({})
 
     assert response["statusCode"] == 200
     body = json.loads(response["body"])
@@ -147,6 +147,132 @@ def test_handle_presign_returns_valid_shape(web_api_handler):
     assert body["key"] == f"uploads/{body['job_id']}/source.mp4"
     assert "test-media-bucket" in body["upload_url"]
     assert body["key"] in body["upload_url"]
+    # No body was sent -- falls back to the same default resolutions the
+    # trigger Lambda uses for any non-web upload.
+    assert body["resolutions"] == web_api_handler.DEFAULT_RESOLUTIONS
+    assert body["upload_headers"]["x-amz-meta-resolutions"] == ",".join(web_api_handler.DEFAULT_RESOLUTIONS)
+
+
+def test_handle_presign_accepts_custom_resolutions(web_api_handler):
+    with mock_aws():
+        s3 = boto3.client("s3", region_name=REGION)
+        s3.create_bucket(Bucket="test-media-bucket")
+
+        event = {"body": json.dumps({"resolutions": ["720p", "480p", "720p"]})}
+        response = web_api_handler._handle_presign(event)
+
+    body = json.loads(response["body"])
+    # De-duped, order preserved -- the duplicate "720p" collapses to one.
+    assert body["resolutions"] == ["720p", "480p"]
+    assert body["upload_headers"]["x-amz-meta-resolutions"] == "720p,480p"
+
+
+def test_handle_presign_drops_unrecognized_resolutions_and_falls_back_if_none_valid(web_api_handler):
+    with mock_aws():
+        s3 = boto3.client("s3", region_name=REGION)
+        s3.create_bucket(Bucket="test-media-bucket")
+
+        event = {"body": json.dumps({"resolutions": ["8k", "not-a-resolution"]})}
+        response = web_api_handler._handle_presign(event)
+
+    body = json.loads(response["body"])
+    assert body["resolutions"] == web_api_handler.DEFAULT_RESOLUTIONS
+
+
+def test_handle_presign_mixed_valid_and_invalid_keeps_only_valid(web_api_handler):
+    with mock_aws():
+        s3 = boto3.client("s3", region_name=REGION)
+        s3.create_bucket(Bucket="test-media-bucket")
+
+        event = {"body": json.dumps({"resolutions": ["1440p", "8k", "240p"]})}
+        response = web_api_handler._handle_presign(event)
+
+    body = json.loads(response["body"])
+    assert body["resolutions"] == ["1440p", "240p"]
+
+
+def test_handle_presign_malformed_json_body_falls_back_to_default(web_api_handler):
+    with mock_aws():
+        s3 = boto3.client("s3", region_name=REGION)
+        s3.create_bucket(Bucket="test-media-bucket")
+
+        response = web_api_handler._handle_presign({"body": "not json"})
+
+    body = json.loads(response["body"])
+    assert body["resolutions"] == web_api_handler.DEFAULT_RESOLUTIONS
+
+
+# --- _handle_download ----------------------------------------------------------
+
+
+def test_handle_download_returns_presigned_urls_when_succeeded(web_api_handler, monkeypatch):
+    fake_output = json.dumps({
+        "job_id": "job-dl-1",
+        "status": "SUCCESS",
+        "resolutions_processed": ["1080p", "720p"],
+        "thumbnail_key": "thumbnails/job-dl-1/thumbnail.jpg",
+        "duration_seconds": 12.3,
+    })
+
+    def _fake_describe_execution(executionArn):  # noqa: N803 - matches boto3's kwarg name
+        return {"status": "SUCCEEDED", "output": fake_output}
+
+    monkeypatch.setattr(web_api_handler.sfn, "describe_execution", _fake_describe_execution)
+
+    with mock_aws():
+        s3 = boto3.client("s3", region_name=REGION)
+        s3.create_bucket(Bucket="test-media-bucket")
+
+        response = web_api_handler._handle_download("job-dl-1")
+
+    assert response["statusCode"] == 200
+    body = json.loads(response["body"])
+    assert body["job_id"] == "job-dl-1"
+    assert "test-media-bucket" in body["thumbnail_url"]
+    assert "thumbnails/job-dl-1/thumbnail.jpg" in body["thumbnail_url"]
+    assert set(body["videos"].keys()) == {"1080p", "720p"}
+    assert "processed/job-dl-1/1080p/video.mp4" in body["videos"]["1080p"]
+    assert "processed/job-dl-1/720p/video.mp4" in body["videos"]["720p"]
+
+
+def test_handle_download_missing_thumbnail_key_returns_null_url(web_api_handler, monkeypatch):
+    fake_output = json.dumps({"resolutions_processed": ["480p"]})
+
+    def _fake_describe_execution(executionArn):  # noqa: N803
+        return {"status": "SUCCEEDED", "output": fake_output}
+
+    monkeypatch.setattr(web_api_handler.sfn, "describe_execution", _fake_describe_execution)
+
+    with mock_aws():
+        s3 = boto3.client("s3", region_name=REGION)
+        s3.create_bucket(Bucket="test-media-bucket")
+
+        response = web_api_handler._handle_download("job-no-thumb")
+
+    body = json.loads(response["body"])
+    assert body["thumbnail_url"] is None
+    assert set(body["videos"].keys()) == {"480p"}
+
+
+def test_handle_download_not_ready_when_still_running(web_api_handler, monkeypatch):
+    def _fake_describe_execution(executionArn):  # noqa: N803
+        return {"status": "RUNNING"}
+
+    monkeypatch.setattr(web_api_handler.sfn, "describe_execution", _fake_describe_execution)
+
+    response = web_api_handler._handle_download("job-still-running")
+
+    assert response["statusCode"] == 409
+    body = json.loads(response["body"])
+    assert body["execution_status"] == "RUNNING"
+
+
+def test_handle_download_not_found(web_api_handler, two_state_machine):
+    response = web_api_handler._handle_download("job-does-not-exist")
+
+    assert response["statusCode"] == 404
+    body = json.loads(response["body"])
+    assert body["execution_status"] == "NOT_FOUND"
 
 
 # --- _handle_status end-to-end against a real (minimal) moto state machine --
@@ -256,6 +382,21 @@ def test_lambda_handler_routes_status(web_api_handler, two_state_machine):
     response = web_api_handler.lambda_handler(event, None)
 
     assert response["statusCode"] == 200
+
+
+def test_lambda_handler_routes_download(web_api_handler, monkeypatch):
+    def _fake_describe_execution(executionArn):  # noqa: N803
+        return {"status": "SUCCEEDED", "output": json.dumps({"resolutions_processed": [], "thumbnail_key": None})}
+
+    monkeypatch.setattr(web_api_handler.sfn, "describe_execution", _fake_describe_execution)
+
+    event = _api_gw_event("GET", "/download/job-route-2", {"job_id": "job-route-2"})
+    response = web_api_handler.lambda_handler(event, None)
+
+    assert response["statusCode"] == 200
+    body = json.loads(response["body"])
+    assert body["thumbnail_url"] is None
+    assert body["videos"] == {}
 
 
 def test_lambda_handler_unknown_route(web_api_handler):

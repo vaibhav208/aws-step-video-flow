@@ -129,6 +129,40 @@
     font-size: 0.85rem;
     text-decoration: underline;
   }
+
+  .res-picker { margin-top: 1rem; }
+  .res-picker .res-label { font-size: 0.8rem; color: var(--muted); margin-bottom: 0.4rem; }
+  .res-options { display: flex; gap: 0.9rem; flex-wrap: wrap; }
+  .res-options label {
+    display: flex; align-items: center; gap: 0.35rem;
+    font-size: 0.85rem; cursor: pointer;
+  }
+  .res-options input { accent-color: var(--running); cursor: pointer; }
+
+  .downloads {
+    margin-top: 1rem;
+    display: none;
+  }
+  .downloads.show { display: block; }
+  .downloads .thumb {
+    max-width: 220px;
+    border-radius: 8px;
+    border: 1px solid #334155;
+    display: block;
+    margin-bottom: 0.9rem;
+  }
+  .downloads .dl-row { display: flex; gap: 0.6rem; flex-wrap: wrap; }
+  .downloads .dl-btn {
+    background: var(--succeeded);
+    color: #052e16;
+    font-weight: 700;
+    text-decoration: none;
+    padding: 0.45rem 0.9rem;
+    border-radius: 7px;
+    font-size: 0.85rem;
+  }
+  .downloads .dl-btn:hover { filter: brightness(1.08); }
+  .downloads .dl-status { font-size: 0.8rem; color: var(--muted); }
 </style>
 </head>
 <body>
@@ -140,6 +174,17 @@
     <div class="upload-row">
       <input type="file" id="fileInput" accept="video/*" />
       <button id="startBtn">Start Processing</button>
+    </div>
+    <div class="res-picker">
+      <div class="res-label">Resolutions to transcode (pick at least one):</div>
+      <div class="res-options" id="resOptions">
+        <label><input type="checkbox" value="1440p" /> 1440p</label>
+        <label><input type="checkbox" value="1080p" checked /> 1080p</label>
+        <label><input type="checkbox" value="720p" checked /> 720p</label>
+        <label><input type="checkbox" value="480p" checked /> 480p</label>
+        <label><input type="checkbox" value="360p" /> 360p</label>
+        <label><input type="checkbox" value="240p" /> 240p</label>
+      </div>
     </div>
     <div class="status-line" id="statusLine"></div>
     <div class="job-id" id="jobIdLine"></div>
@@ -168,6 +213,11 @@
 
   <div class="result" id="result">
     <h3 id="result-title"></h3>
+    <div class="downloads" id="downloads">
+      <img class="thumb" id="thumbImg" style="display:none;" />
+      <div class="dl-row" id="dlRow"></div>
+      <div class="dl-status" id="dlStatus"></div>
+    </div>
     <pre id="result-body"></pre>
     <a class="reset-link" id="resetLink">Upload another video &rarr;</a>
   </div>
@@ -188,6 +238,11 @@ const resetLink = document.getElementById("resetLink");
 const transcodeSub = document.getElementById("transcode-sub");
 const doneLabel = document.getElementById("done-label");
 const doneSub = document.getElementById("done-sub");
+const resOptions = document.getElementById("resOptions");
+const downloads = document.getElementById("downloads");
+const thumbImg = document.getElementById("thumbImg");
+const dlRow = document.getElementById("dlRow");
+const dlStatus = document.getElementById("dlStatus");
 
 let pollTimer = null;
 let notFoundStreak = 0;
@@ -220,6 +275,48 @@ function stopPolling() {
   }
 }
 
+function renderDownloads(job_id, dl) {
+  dlRow.innerHTML = "";
+  thumbImg.style.display = "none";
+
+  if (dl.thumbnail_url) {
+    thumbImg.src = dl.thumbnail_url;
+    thumbImg.style.display = "block";
+  }
+
+  const resolutions = Object.keys(dl.videos || {});
+  if (resolutions.length === 0) {
+    dlStatus.textContent = "No transcoded resolutions found for this job.";
+  } else {
+    dlStatus.textContent = "";
+    resolutions.forEach((res) => {
+      const a = document.createElement("a");
+      a.className = "dl-btn";
+      a.href = dl.videos[res];
+      a.textContent = "Download " + res;
+      a.setAttribute("download", job_id + "-" + res + ".mp4");
+      dlRow.appendChild(a);
+    });
+  }
+  downloads.classList.add("show");
+}
+
+async function loadDownloads(job_id) {
+  dlStatus.textContent = "Preparing download links...";
+  downloads.classList.add("show");
+  try {
+    const resp = await fetch(API_BASE + "/download/" + encodeURIComponent(job_id));
+    if (!resp.ok) {
+      dlStatus.textContent = "Downloads aren't ready yet (" + resp.status + ").";
+      return;
+    }
+    const dl = await resp.json();
+    renderDownloads(job_id, dl);
+  } catch (err) {
+    dlStatus.textContent = "Error loading downloads: " + err.message;
+  }
+}
+
 function showTerminal(body) {
   stopPolling();
   if (body.execution_status === "SUCCEEDED") {
@@ -228,6 +325,7 @@ function showTerminal(body) {
     setNode("done", "succeeded");
     resultTitle.textContent = "✅ Execution succeeded";
     resultBody.textContent = JSON.stringify(body.output || {}, null, 2);
+    loadDownloads(body.job_id);
   } else {
     doneLabel.textContent = "Job Failed";
     doneSub.textContent = body.error || body.execution_status;
@@ -276,6 +374,11 @@ function resetUI() {
   jobIdLine.textContent = "";
   flow.style.display = "none";
   result.classList.remove("show");
+  downloads.classList.remove("show");
+  dlRow.innerHTML = "";
+  dlStatus.textContent = "";
+  thumbImg.style.display = "none";
+  thumbImg.src = "";
   document.querySelectorAll(".node").forEach((el) => (el.className = "node"));
   transcodeSub.textContent = "ECS Fargate, all requested resolutions";
   doneLabel.textContent = "Job Result";
@@ -284,10 +387,20 @@ function resetUI() {
 
 resetLink.addEventListener("click", resetUI);
 
+function selectedResolutions() {
+  return Array.from(resOptions.querySelectorAll("input[type=checkbox]:checked")).map((el) => el.value);
+}
+
 startBtn.addEventListener("click", async () => {
   const file = fileInput.files[0];
   if (!file) {
     setStatus("Choose a video file first.", true);
+    return;
+  }
+
+  const resolutions = selectedResolutions();
+  if (resolutions.length === 0) {
+    setStatus("Pick at least one resolution to transcode.", true);
     return;
   }
 
@@ -296,16 +409,25 @@ startBtn.addEventListener("click", async () => {
   setStatus("Requesting upload URL...");
 
   try {
-    const presignResp = await fetch(API_BASE + "/presign", { method: "POST" });
+    const presignResp = await fetch(API_BASE + "/presign", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ resolutions }),
+    });
     if (!presignResp.ok) throw new Error("presign request failed (" + presignResp.status + ")");
-    const { job_id, upload_url } = await presignResp.json();
+    const { job_id, upload_url, upload_headers, resolutions: acceptedResolutions } = await presignResp.json();
 
-    jobIdLine.textContent = "job_id: " + job_id;
+    jobIdLine.textContent = "job_id: " + job_id + "  |  resolutions: " + acceptedResolutions.join(", ");
     setStatus("Uploading " + file.name + "...");
 
+    // upload_headers comes straight from the presign response and must be
+    // sent verbatim -- it's exactly what was cryptographically signed into
+    // upload_url (including the resolutions choice as object metadata), so
+    // hardcoding headers here instead would fail the PUT with a signature
+    // mismatch the moment they drift apart.
     const putResp = await fetch(upload_url, {
       method: "PUT",
-      headers: { "Content-Type": "video/mp4" },
+      headers: upload_headers,
       body: file,
     });
     if (!putResp.ok) throw new Error("upload failed (" + putResp.status + ")");

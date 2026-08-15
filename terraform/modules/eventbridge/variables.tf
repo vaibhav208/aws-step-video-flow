@@ -7,6 +7,11 @@ variable "media_bucket_name" {
   type        = string
 }
 
+variable "media_bucket_arn" {
+  description = "The trigger Lambda's HeadObject permission (used to read a per-upload resolution choice set by web_api's /presign, see src/lambda/trigger/handler.py) is scoped to uploads/* under this bucket."
+  type        = string
+}
+
 variable "state_machine_arn" {
   description = "The trigger Lambda's only AWS permission (states:StartExecution) is scoped to exactly this ARN."
   type        = string

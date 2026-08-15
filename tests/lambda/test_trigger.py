@@ -94,6 +94,76 @@ def test_uses_custom_target_resolutions(trigger_handler, state_machine, monkeypa
     assert json.loads(execution["input"])["resolutions"] == ["1080p", "240p"]
 
 
+# --- per-upload resolution choice via object metadata (Phase 6) -------------
+
+
+def test_uses_resolutions_from_web_frontend_object_metadata(trigger_handler, state_machine):
+    # Mirrors exactly what web_api's /presign bakes into the presigned PUT
+    # (see src/lambda/web_api/handler.py's _handle_presign) -- the trigger
+    # Lambda reads it back via its own HeadObject call.
+    s3 = boto3.client("s3", region_name=REGION)
+    s3.create_bucket(Bucket="my-media-bucket")
+    s3.put_object(
+        Bucket="my-media-bucket",
+        Key="uploads/job-web-1/source.mp4",
+        Body=b"fake video bytes",
+        Metadata={"resolutions": "1080p,240p"},
+    )
+    event = _s3_object_created_event("my-media-bucket", "uploads/job-web-1/source.mp4")
+
+    result = trigger_handler.lambda_handler(event, None)
+
+    execution = state_machine.describe_execution(executionArn=result["execution_arn"])
+    assert json.loads(execution["input"])["resolutions"] == ["1080p", "240p"]
+
+
+def test_dedupes_resolutions_from_object_metadata(trigger_handler, state_machine):
+    s3 = boto3.client("s3", region_name=REGION)
+    s3.create_bucket(Bucket="my-media-bucket")
+    s3.put_object(
+        Bucket="my-media-bucket",
+        Key="uploads/job-web-dup/source.mp4",
+        Body=b"fake video bytes",
+        Metadata={"resolutions": "1080p,1080p,480p"},
+    )
+    event = _s3_object_created_event("my-media-bucket", "uploads/job-web-dup/source.mp4")
+
+    result = trigger_handler.lambda_handler(event, None)
+
+    execution = state_machine.describe_execution(executionArn=result["execution_arn"])
+    assert json.loads(execution["input"])["resolutions"] == ["1080p", "480p"]
+
+
+def test_ignores_unrecognized_resolutions_in_metadata_and_falls_back_to_default(trigger_handler, state_machine):
+    s3 = boto3.client("s3", region_name=REGION)
+    s3.create_bucket(Bucket="my-media-bucket")
+    s3.put_object(
+        Bucket="my-media-bucket",
+        Key="uploads/job-web-2/source.mp4",
+        Body=b"fake video bytes",
+        Metadata={"resolutions": "8k,not-a-resolution"},
+    )
+    event = _s3_object_created_event("my-media-bucket", "uploads/job-web-2/source.mp4")
+
+    result = trigger_handler.lambda_handler(event, None)
+
+    execution = state_machine.describe_execution(executionArn=result["execution_arn"])
+    assert json.loads(execution["input"])["resolutions"] == ["1080p", "720p", "480p"]
+
+
+def test_missing_source_object_still_falls_back_to_default_resolutions(trigger_handler, state_machine):
+    # No S3 bucket/object created at all -- HeadObject itself fails (not
+    # just "no metadata present"), which must not prevent an execution from
+    # starting.
+    event = _s3_object_created_event("my-media-bucket", "uploads/job-web-3/source.mp4")
+
+    result = trigger_handler.lambda_handler(event, None)
+
+    assert result["started"] is True
+    execution = state_machine.describe_execution(executionArn=result["execution_arn"])
+    assert json.loads(execution["input"])["resolutions"] == ["1080p", "720p", "480p"]
+
+
 def test_duplicate_delivery_is_idempotent(trigger_handler, state_machine, monkeypatch):
     # moto's Step Functions backend doesn't enforce real AWS's
     # (name, input)-uniqueness rule for StartExecution, so a second

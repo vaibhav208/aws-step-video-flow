@@ -18,10 +18,26 @@ cors_configuration block and never reaches this function.
 Routes
 ------
 POST /presign
-    Request body: ignored (job_id is generated server-side, avoiding any
-    client-supplied job_id that would need sanitizing against the
-    uploads/<job_id>/... key shape src/lambda/trigger/handler.py expects).
-    Response: {"job_id": "...", "upload_url": "...", "key": "uploads/.../source.mp4"}
+    Request body (optional):
+        {"resolutions": ["1080p", "720p"]}   # any subset of ALLOWED_RESOLUTIONS
+    Unrecognized values are dropped; if nothing valid is left (including an
+    empty/missing body), DEFAULT_RESOLUTIONS is used -- same defaulting
+    behavior as an upload that skips the web frontend entirely. The chosen
+    list is baked into the presigned PUT as `x-amz-meta-resolutions` object
+    metadata, which src/lambda/trigger/handler.py reads back via HeadObject
+    once the upload fires the pipeline (EventBridge's S3 event itself
+    doesn't carry object metadata, so it can't be threaded through that
+    path directly -- see that module's docstring).
+    Response:
+        {
+            "job_id": "...", "key": "uploads/.../source.mp4",
+            "upload_url": "...", "resolutions": ["1080p", "720p"],
+            "upload_headers": {"Content-Type": "video/mp4", "x-amz-meta-resolutions": "1080p,720p"}
+        }
+    The caller MUST send exactly `upload_headers` on the PUT to `upload_url`
+    -- they're part of what was cryptographically signed into the URL, so
+    any mismatch (a missing header, a different Content-Type) fails the PUT
+    with SignatureDoesNotMatch rather than silently ignoring the metadata.
 
 GET /status/{job_id}
     Response:
@@ -37,6 +53,19 @@ GET /status/{job_id}
     execution has started yet for this job_id -- expected for a few seconds
     right after upload, while EventBridge + the trigger Lambda catch up.
 
+GET /download/{job_id}
+    Only meaningful once /status reports SUCCEEDED (this route re-checks
+    that itself rather than trusting the caller). Reads `thumbnail_key` and
+    `resolutions_processed` off the execution's own output (written by the
+    ASL's BuildExecutionSummary state) and turns each into a short-lived
+    presigned GET URL -- the media bucket has no public read access, so
+    these are the only way a browser can actually fetch the thumbnail or
+    a transcoded resolution.
+    Response:
+        {"job_id": "...", "thumbnail_url": "..." | null, "videos": {"1080p": "...", ...}}
+    or 409 {"job_id": "...", "execution_status": "RUNNING", "error": "..."}
+    if the execution hasn't succeeded yet, or 404 NOT_FOUND as above.
+
 Simplification, deliberate: this collapses the ASL's ~20 states (see
 step-functions/state-machine.asl.json.tpl) onto 9 "logical" nodes for the
 frontend's flow diagram (_NODE_ORDER / _STATE_TO_NODE below). States not
@@ -50,6 +79,7 @@ top-level error/cause fields DescribeExecution already provides.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -68,6 +98,22 @@ sfn = boto3.client("stepfunctions")
 MEDIA_BUCKET = os.environ["MEDIA_BUCKET"]
 STATE_MACHINE_ARN = os.environ["STATE_MACHINE_ARN"]
 PRESIGNED_URL_EXPIRY_SECONDS = int(os.environ.get("PRESIGNED_URL_EXPIRY_SECONDS", "300"))
+DOWNLOAD_URL_EXPIRY_SECONDS = int(os.environ.get("DOWNLOAD_URL_EXPIRY_SECONDS", "3600"))
+
+# Mirrors src/video-processor/app/main.py's RESOLUTION_PRESETS keys and
+# src/lambda/trigger/handler.py's ALLOWED_RESOLUTIONS -- kept as a separate
+# literal in each function (rather than a shared import) because every
+# Lambda in this project is packaged and deployed completely independently.
+ALLOWED_RESOLUTIONS = {"1440p", "1080p", "720p", "480p", "360p", "240p"}
+DEFAULT_RESOLUTIONS = ["1080p", "720p", "480p"]
+
+# Matches the video-processor app's own OUTPUT_PREFIX default ("processed",
+# see src/video-processor/app/main.py) -- not read from an env var here
+# because nothing in this project's Terraform ever overrides that default
+# on the ECS side either, so hardcoding the two in lockstep is simpler than
+# threading one more variable through two unrelated modules for a value
+# that has never actually varied.
+OUTPUT_PREFIX = "processed"
 
 _CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",
@@ -134,18 +180,70 @@ def _response(status_code: int, body: dict) -> dict:
     }
 
 
-def _handle_presign() -> dict:
+def _dedupe_preserve_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for v in values:
+        if v not in seen:
+            seen.add(v)
+            result.append(v)
+    return result
+
+
+def _resolutions_from_request_body(event: dict) -> list[str]:
+    raw_body = event.get("body") or "{}"
+    if event.get("isBase64Encoded"):
+        try:
+            raw_body = base64.b64decode(raw_body).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            raw_body = "{}"
+
+    try:
+        parsed = json.loads(raw_body)
+    except json.JSONDecodeError:
+        parsed = {}
+
+    requested = parsed.get("resolutions") if isinstance(parsed, dict) else None
+    if not isinstance(requested, list):
+        requested = []
+
+    valid = _dedupe_preserve_order(
+        [r for r in requested if isinstance(r, str) and r in ALLOWED_RESOLUTIONS]
+    )
+    return valid or list(DEFAULT_RESOLUTIONS)
+
+
+def _handle_presign(event: dict) -> dict:
     job_id = f"job-web-{int(time.time())}-{uuid.uuid4().hex[:6]}"
     key = f"uploads/{job_id}/source.mp4"
+    resolutions = _resolutions_from_request_body(event)
+    resolutions_header = ",".join(resolutions)
 
     upload_url = s3.generate_presigned_url(
         "put_object",
-        Params={"Bucket": MEDIA_BUCKET, "Key": key, "ContentType": "video/mp4"},
+        Params={
+            "Bucket": MEDIA_BUCKET,
+            "Key": key,
+            "ContentType": "video/mp4",
+            "Metadata": {"resolutions": resolutions_header},
+        },
         ExpiresIn=PRESIGNED_URL_EXPIRY_SECONDS,
     )
 
-    logger.info("Issued presigned upload URL for job_id=%s key=%s", job_id, key)
-    return _response(200, {"job_id": job_id, "upload_url": upload_url, "key": key})
+    logger.info(
+        "Issued presigned upload URL for job_id=%s key=%s resolutions=%s",
+        job_id, key, resolutions,
+    )
+    return _response(200, {
+        "job_id": job_id,
+        "upload_url": upload_url,
+        "key": key,
+        "resolutions": resolutions,
+        "upload_headers": {
+            "Content-Type": "video/mp4",
+            "x-amz-meta-resolutions": resolutions_header,
+        },
+    })
 
 
 def _execution_arn_for(job_id: str) -> str:
@@ -259,19 +357,78 @@ def _handle_status(job_id: str) -> dict:
     return _response(200, result)
 
 
+def _handle_download(job_id: str) -> dict:
+    execution_arn = _execution_arn_for(job_id)
+
+    try:
+        desc = sfn.describe_execution(executionArn=execution_arn)
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "ExecutionDoesNotExist":
+            return _response(404, {"execution_status": "NOT_FOUND", "job_id": job_id})
+        raise
+
+    status = desc["status"]
+    if status != "SUCCEEDED":
+        # 409 Conflict: the request is well-formed, but downloads don't
+        # exist yet (still RUNNING) or never will (FAILED/TIMED_OUT/ABORTED)
+        # -- distinct from 404, which means "no such job at all".
+        return _response(409, {
+            "job_id": job_id,
+            "execution_status": status,
+            "error": "Downloads are only available once the execution has SUCCEEDED.",
+        })
+
+    try:
+        output = json.loads(desc.get("output") or "{}")
+    except json.JSONDecodeError:
+        output = {}
+
+    thumbnail_key = output.get("thumbnail_key")
+    resolutions_processed = output.get("resolutions_processed") or []
+
+    thumbnail_url = None
+    if thumbnail_key:
+        thumbnail_url = s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": MEDIA_BUCKET, "Key": thumbnail_key},
+            ExpiresIn=DOWNLOAD_URL_EXPIRY_SECONDS,
+        )
+
+    videos = {}
+    for resolution in resolutions_processed:
+        # Deterministic from src/video-processor/app/main.py's own
+        # output_key construction -- this function never lists the bucket,
+        # it just reconstructs the same key the ECS task already wrote to.
+        key = f"{OUTPUT_PREFIX}/{job_id}/{resolution}/video.mp4"
+        videos[resolution] = s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": MEDIA_BUCKET, "Key": key},
+            ExpiresIn=DOWNLOAD_URL_EXPIRY_SECONDS,
+        )
+
+    logger.info("Issued %d download URL(s) for job_id=%s", len(videos) + (1 if thumbnail_url else 0), job_id)
+    return _response(200, {"job_id": job_id, "thumbnail_url": thumbnail_url, "videos": videos})
+
+
 def lambda_handler(event, context):  # noqa: ARG001 - context required by Lambda
     http = event.get("requestContext", {}).get("http", {})
     method = http.get("method", "")
     path = event.get("rawPath", "")
 
     if method == "POST" and path == "/presign":
-        return _handle_presign()
+        return _handle_presign(event)
 
     if method == "GET" and path.startswith("/status/"):
         job_id = (event.get("pathParameters") or {}).get("job_id", "")
         if not job_id:
             return _response(400, {"error": "missing job_id"})
         return _handle_status(job_id)
+
+    if method == "GET" and path.startswith("/download/"):
+        job_id = (event.get("pathParameters") or {}).get("job_id", "")
+        if not job_id:
+            return _response(400, {"error": "missing job_id"})
+        return _handle_download(job_id)
 
     logger.warning("No route for %s %s", method, path)
     return _response(404, {"error": f"no route for {method} {path}"})
